@@ -1,0 +1,337 @@
+"""FastAPI 入口：上传 XLSX、依赖图查询、影响面分析、JSON 导出。"""
+from __future__ import annotations
+
+import io
+import time
+import uuid
+from collections import OrderedDict
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from openpyxl import load_workbook
+from pydantic import BaseModel
+
+from .graph import (
+    AUDIT_LEVELS,
+    DEFAULT_FANOUT_THRESHOLD,
+    DEFAULT_KEY_PATHS,
+    MAX_KEY_PATHS_QUERY,
+    WorkbookGraph,
+    display_id,
+)
+from .relocate import (
+    RelocateInputError,
+    RelocateSheetError,
+    preview_to_tsv,
+    relocate_preview,
+)
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰最旧的
+
+STATIC_DIR = Path(__file__).parent / "static"
+SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
+
+app = FastAPI(title="电子表格公式影响分析", version="1.1.0")
+
+# wid -> {"graph": WorkbookGraph, "filename": str, "ts": float}
+_store: OrderedDict[str, dict] = OrderedDict()
+
+
+def _get(wid: str) -> dict:
+    entry = _store.get(wid)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="工作簿不存在或已被淘汰，请重新上传")
+    _store.move_to_end(wid)
+    return entry
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    filename = file.filename or "workbook.xlsx"
+    if not filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx / .xlsm 文件")
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="文件超过 25MB 限制")
+    try:
+        wb_formula = load_workbook(io.BytesIO(data), data_only=False, read_only=False)
+        wb_values = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无法解析文件: {exc}") from exc
+
+    graph = WorkbookGraph.from_workbooks(wb_formula, wb_values)
+    wid = uuid.uuid4().hex[:12]
+    _store[wid] = {"graph": graph, "filename": filename, "ts": time.time(),
+                   "wb": wb_formula}
+    while len(_store) > MAX_WORKBOOKS:
+        _store.popitem(last=False)
+
+    return {"workbook_id": wid, "filename": filename, **graph.summary()}
+
+
+@app.get("/api/workbooks/{wid}")
+def workbook_summary(wid: str):
+    entry = _get(wid)
+    return {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        **entry["graph"].summary(),
+    }
+
+
+@app.get("/api/workbooks/{wid}/cells")
+def workbook_cells(
+    wid: str,
+    sheet: str | None = Query(default=None),
+    q: str = Query(default=""),
+    formulas_only: bool = Query(default=True),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+):
+    graph = _get(wid)["graph"]
+    return graph.cell_list(sheet=sheet, query=q, formulas_only=formulas_only,
+                           limit=limit, offset=offset)
+
+
+def _resolve_cell(graph: WorkbookGraph, cell: str) -> tuple[str, str, str]:
+    """把前端传入的单元格标识（兼容引号 / 绝对引用）解析为内部 node id。"""
+    normalized = cell
+    if normalized.startswith("'") and "'!" in normalized:
+        normalized = normalized[1:].replace("'!", "!", 1)
+    if "!" not in normalized:
+        raise HTTPException(status_code=400, detail="cell 参数格式应为 工作表!坐标")
+    sheet, coord = normalized.rsplit("!", 1)
+    coord = coord.replace("$", "").upper()
+    if sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    return f"{sheet}!{coord}", sheet, coord
+
+
+@app.get("/api/workbooks/{wid}/impact")
+def workbook_impact(
+    wid: str,
+    cell: str = Query(..., description="形如 '计算!B1' 的单元格 id"),
+    direction: str = Query(default="downstream", pattern="^(downstream|upstream)$"),
+    max_depth: int = Query(default=50, ge=1, le=200),
+):
+    graph = _get(wid)["graph"]
+    node, sheet, coord = _resolve_cell(graph, cell)
+    result = graph.impact(node, direction=direction, max_depth=max_depth)
+    result["root_display"] = display_id(sheet, coord)
+    result["root_formula"] = graph.formulas.get(node)
+    result["root_value"] = graph.values.get(node)
+    result["root_in_cycle"] = node in graph.cycle_nodes
+    result["root_names"] = graph._names_of(node)
+    return result
+
+
+@app.get("/api/workbooks/{wid}/key-nodes")
+def workbook_key_nodes(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 计算!B1"),
+    sheet: str | None = Query(default=None, description="按关键节点所在工作表筛选"),
+    sort: str = Query(default="coverage",
+                      pattern="^(coverage|affected|depth)$"),
+    min_coverage: int = Query(default=1, ge=1, le=10**9),
+    max_paths: int = Query(default=DEFAULT_KEY_PATHS, ge=1,
+                           le=MAX_KEY_PATHS_QUERY),
+):
+    graph = _get(wid)["graph"]
+    node, target_sheet, coord = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    result = graph.key_nodes(node, sheet=sheet, sort=sort,
+                             min_coverage=min_coverage, max_paths=max_paths)
+    result["workbook_id"] = wid
+    result["root_display"] = display_id(target_sheet, coord)
+    return result
+
+
+@app.get("/api/workbooks/{wid}/key-nodes/export")
+def workbook_key_nodes_export(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 计算!B1"),
+    sheet: str | None = Query(default=None, description="按关键节点所在工作表筛选"),
+    sort: str = Query(default="coverage",
+                      pattern="^(coverage|affected|depth)$"),
+    max_paths: int = Query(default=DEFAULT_KEY_PATHS, ge=1,
+                           le=MAX_KEY_PATHS_QUERY),
+):
+    """导出关键节点分析 JSON：不做行数 / 受影响下游截断，证据路径完整。"""
+    entry = _get(wid)
+    graph = entry["graph"]
+    node, target_sheet, coord = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    result = graph.key_nodes(node, sheet=sheet, sort=sort,
+                             min_coverage=1, limit=None, max_paths=max_paths)
+    payload = {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        "target": node,
+        "target_display": display_id(target_sheet, coord),
+        **result,
+    }
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=key_nodes_{wid}.json; "
+                f"filename*=UTF-8''key_nodes_{wid}.json"
+            )
+        },
+    )
+
+
+@app.get("/api/workbooks/{wid}/audit")
+def workbook_audit(
+    wid: str,
+    level: list[str] | None = Query(
+        default=None,
+        description="问题级别筛选，可重复传参：error / warning / info"),
+    sheet: str | None = Query(default=None, description="按工作表筛选"),
+    fanout_threshold: str | None = Query(
+        default=None,
+        description=f"扇出告警阈值，1-10000 的整数，默认 {DEFAULT_FANOUT_THRESHOLD}"),
+):
+    graph = _get(wid)["graph"]
+
+    levels = AUDIT_LEVELS if not level else tuple(dict.fromkeys(level))
+    bad = [lv for lv in levels if lv not in AUDIT_LEVELS]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"level 取值非法: {bad[0]}，仅支持 {list(AUDIT_LEVELS)}")
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+
+    threshold = DEFAULT_FANOUT_THRESHOLD
+    if fanout_threshold is not None:
+        try:
+            threshold = int(fanout_threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="fanout_threshold 必须是 1-10000 的整数") from None
+        if not 1 <= threshold <= 10000:
+            raise HTTPException(
+                status_code=400,
+                detail="fanout_threshold 必须是 1-10000 的整数")
+
+    return {
+        "workbook_id": wid,
+        **graph.audit(levels=levels, sheet=sheet, fanout_threshold=threshold),
+    }
+
+
+@app.get("/api/workbooks/{wid}/audit/export")
+def workbook_audit_export(wid: str):
+    entry = _get(wid)
+    g = entry["graph"]
+    payload = {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        "defined_names": g.name_inventory_json(),
+        "name_usages": g.name_usages_json(),
+        "audit": g.audit(evidence_limit=None),
+    }
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=dependency_audit_{wid}.json; "
+                f"filename*=UTF-8''dependency_audit_{wid}.json"
+            )
+        },
+    )
+
+
+@app.get("/api/workbooks/{wid}/export")
+def workbook_export(wid: str):
+    entry = _get(wid)
+    payload = entry["graph"].export(entry["filename"])
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=impact_analysis_{wid}.json; "
+                f"filename*=UTF-8''impact_analysis_{wid}.json"
+            )
+        },
+    )
+
+
+class RelocateRequest(BaseModel):
+    source_sheet: str
+    source_range: str
+    target_sheet: str
+    target_anchor: str
+
+
+def _run_relocate(wid: str, req: RelocateRequest) -> dict:
+    entry = _get(wid)
+    try:
+        preview = relocate_preview(
+            entry["graph"], entry["wb"],
+            req.source_sheet, req.source_range,
+            req.target_sheet, req.target_anchor,
+        )
+    except RelocateSheetError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RelocateInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    preview["workbook_id"] = wid
+    preview["filename"] = entry["filename"]
+    return preview
+
+
+@app.post("/api/workbooks/{wid}/relocate/preview")
+def workbook_relocate_preview(wid: str, req: RelocateRequest):
+    """公式区域搬移预演：逐格返回原公式 / 拟写入公式 / 目标冲突。
+
+    预演不修改工作簿；存在无法平移的引用时仍返回 200，但 exportable=false
+    并在 errors 中列出逐格错误，此时 TSV 接口拒绝导出。
+    """
+    return _run_relocate(wid, req)
+
+
+@app.post("/api/workbooks/{wid}/relocate/tsv")
+def workbook_relocate_tsv(wid: str, req: RelocateRequest):
+    """导出预演 TSV（目标位置 + 拟写入公式，UTF-8 BOM，供 Excel 粘贴）。"""
+    preview = _run_relocate(wid, req)
+    if not preview["exportable"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"存在 {preview['error_count']} 处无法平移的引用，"
+                   "本次预演不可导出，请先修正后重试")
+    tsv = preview_to_tsv(preview)
+    return Response(
+        content=tsv.encode("utf-8"),
+        media_type="text/tab-separated-values; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename=relocate_{wid}.tsv; "
+                f"filename*=UTF-8''relocate_{wid}.tsv"
+        },
+    )
+
+
+@app.get("/samples/{name}")
+def sample_file(name: str):
+    """提供 samples/ 目录下的示例文件下载。"""
+    path = (SAMPLES_DIR / name).resolve()
+    if not str(path).startswith(str(SAMPLES_DIR.resolve())) or not path.is_file():
+        raise HTTPException(status_code=404, detail="示例文件不存在")
+    return FileResponse(path, filename=name)
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "workbooks": len(_store)}
