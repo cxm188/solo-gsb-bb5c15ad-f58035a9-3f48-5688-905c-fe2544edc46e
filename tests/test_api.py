@@ -387,3 +387,83 @@ def test_audit_undefined_name_endpoint():
     errs = client.get(f"/api/workbooks/{wid}/audit",
                       params={"level": "error"}).json()["issues"]
     assert {i["code"] for i in errs} == {"undefined_name"}
+
+
+def make_deviations_xlsx() -> bytes:
+    """同列偏离：S1!C2:C6 主流 4 格、C5 偏离；B2:B5 平票不报；S2 全部一致。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    for r in range(2, 7):
+        ws[f"C{r}"] = f"=A{r}+$B$1"
+    ws["C5"] = "=A5+999"
+    ws["B2"], ws["B3"] = "=A2", "=A3"
+    ws["B4"], ws["B5"] = "=A4*2", "=A5*2"
+    ws2 = wb.create_sheet("S2")
+    for r in range(2, 6):
+        ws2[f"B{r}"] = f"=A{r}+1"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_formula_deviations_endpoint():
+    r = client.post("/api/upload", files={"file": ("d.xlsx", make_deviations_xlsx(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    wid = r.json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/formula-deviations")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["workbook_id"] == wid
+    assert d["total"] == 1
+    assert d["min_segment_cells"] == 3
+    # B2:B5 平票仍计入参与检查的区段，但不是异常区段（S1 共 2 段，S2 共 1 段）
+    assert d["checked_segment_count"] == 3
+    assert d["anomalous_segment_count"] == 1
+    assert d["deviation_cell_count"] == 1
+    assert d["total_deviation_cell_count"] == 1
+    seg = d["segments"][0]
+    assert seg["sheet"] == "S1" and seg["segment"] == "C2:C6"
+    assert seg["segment_display"] == "S1!C2:C6"
+    assert seg["majority_count"] == 4 and seg["deviation_count"] == 1
+    assert seg["majority_example_formula"] == "=A2+$B$1"
+    assert seg["majority_pattern"] == "=R[0]C[-2]+R1C2"
+    odd = seg["deviations"][0]
+    assert odd["cell"] == "S1!C5" and odd["display"] == "S1!C5"
+    assert odd["coord"] == "C5" and odd["formula"] == "=A5+999"
+    assert odd["pattern"] == "=R[0]C[-2]+999"
+    # 汇总覆盖两表
+    stats = {s["name"]: s for s in d["sheets"]}
+    assert stats["S1"]["checked_segments"] == 2
+    assert stats["S1"]["anomalous_segments"] == 1
+    assert stats["S2"]["checked_segments"] == 1
+    assert stats["S2"]["anomalous_segments"] == 0
+    assert d["filters"] == {"sheet": None}
+
+
+def test_formula_deviations_sheet_filter():
+    wid = client.post("/api/upload", files={"file": ("d.xlsx", make_deviations_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/formula-deviations",
+                   params={"sheet": "S2"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["segments"] == [] and d["total"] == 0
+    assert d["deviation_cell_count"] == 0
+    # 全局计数仍保留 S1 上的异常区段
+    assert d["anomalous_segment_count"] == 1
+    assert d["total_deviation_cell_count"] == 1
+    # sheets 汇总仍覆盖整本工作簿
+    assert {s["name"] for s in d["sheets"]} == {"S1", "S2"}
+    assert d["filters"] == {"sheet": "S2"}
+    r = client.get(f"/api/workbooks/{wid}/formula-deviations",
+                   params={"sheet": "S1"})
+    assert len(r.json()["segments"]) == 1
+    # 工作表不存在
+    assert client.get(f"/api/workbooks/{wid}/formula-deviations",
+                      params={"sheet": "不存在"}).status_code == 404
+
+
+def test_formula_deviations_missing_workbook_is_404():
+    assert client.get("/api/workbooks/deadbeefab/formula-deviations").status_code == 404

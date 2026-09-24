@@ -144,6 +144,17 @@
   #dropHint { border: 2px dashed var(--border); border-radius: 10px; padding: 40px;
               text-align: center; color: var(--muted); margin: 30px; }
   #dropHint.drag { border-color: var(--accent); color: var(--accent); }
+  /* 同列公式偏离面板 */
+  #devView select { width: auto; min-width: 160px; }
+  #devView .filters-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .dev-seg { margin-bottom: 14px; }
+  .dev-seg-title { font-family: ui-monospace, Consolas, monospace; font-size: 13px; margin-bottom: 4px; }
+  .dev-pattern { color: var(--muted); font-size: 11px; font-family: ui-monospace, Consolas, monospace; }
+  .dev-main { color: var(--accent2); }
+  .dev-odd { color: #fbbf24; }
+  .badge.dev { background: #78350f; color: #fde68a; font-family: ui-monospace, Consolas, monospace; }
+  .dev-stat { border-radius: 8px; padding: 6px 12px; background: var(--panel2); font-size: 13px; }
+  .dev-stat b { font-size: 16px; margin-left: 6px; }
   .toast { position: fixed; top: 16px; right: 16px; background: #7f1d1d; color: #fecaca;
            padding: 10px 16px; border-radius: 8px; display: none; z-index: 9; max-width: 420px; }
   .muted { color: var(--muted); }
@@ -154,6 +165,7 @@
   <h1>📊 电子表格公式影响分析</h1>
   <span id="fname" class="muted"></span>
   <button class="btn ghost" id="auditBtn" disabled>🩺 依赖健康审计<span id="auditCountPill"></span></button>
+  <button class="btn ghost" id="devBtn" disabled>🧮 同列公式偏离</button>
   <button class="btn ghost" id="moveBtn" disabled>📋 公式搬移预演</button>
   <button class="btn ghost" id="auditExportBtn" disabled>导出审计 JSON</button>
   <button class="btn ghost" id="exportBtn" disabled>导出分析 JSON</button>
@@ -214,6 +226,36 @@
             <th style="width:190px">单元格位置</th><th>问题与证据边</th>
           </tr></thead>
           <tbody id="auditRows"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="devView" style="display:none">
+      <div class="card">
+        <h3>🧮 同列公式偏离检查
+          <button class="btn ghost" id="devExportBtn" style="float:right;padding:3px 12px;font-size:12px">导出检查结果 JSON</button>
+        </h3>
+        <div class="muted" style="font-size:12px;line-height:1.7">
+          按工作表、列把<b>行号相邻</b>的公式格划为区段（非公式行断开）；将每条公式按其所在格归一为
+          <b>R1C1 相对模板</b>：相对引用记为相对位移，<b>$ 绝对行列保持绝对号</b>，跨表限定、整行 / 整列、
+          定义名称与字符串等原样保留（如 <span class="mono">=A2+$B$1</span> 与下一行的
+          <span class="mono">=A3+$B$1</span> 是同一模板）。只检查<b>至少 3 格</b>的区段：
+          某模板数量<b>严格超过一半</b>时，其余公式标记为偏离；平票或无多数不报。
+        </div>
+        <div class="filters-row" style="margin-top:10px">
+          <select id="devSheet"><option value="">全部工作表</option></select>
+          <button class="btn" id="devRunBtn" style="padding:6px 14px">重新检查</button>
+          <span id="devErr" class="muted" style="font-size:12px;color:var(--warn)"></span>
+        </div>
+        <div class="audit-counts" id="devSummary"></div>
+      </div>
+      <div class="card">
+        <h3 id="devTableTitle">异常区段清单</h3>
+        <table>
+          <thead><tr>
+            <th style="width:170px">异常坐标</th><th style="width:170px">区段范围</th>
+            <th>原公式 / 主流公式示例（模板）</th>
+          </tr></thead>
+          <tbody id="devRows"></tbody>
         </table>
       </div>
     </div>
@@ -337,7 +379,7 @@
 <div class="toast" id="toast"></div>
 
 <script>
-let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null;
+let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null, SHEETS = [];
 const LEVEL_LABEL = { error: '错误', warning: '警告', info: '提示' };
 const CODE_LABEL = {
   missing_sheet: '工作表不存在',
@@ -418,6 +460,7 @@ async function uploadFile(file) {
 }
 
 function onUploaded(d) {
+  SHEETS = d.sheets.map(s => s.name);
   $('fname').textContent = d.filename;
   $('dropHint').style.display = 'none';
   $('main').style.display = 'flex';
@@ -445,11 +488,15 @@ function onUploaded(d) {
   const ksel = $('knSheet');
   ksel.innerHTML = '<option value="">全部工作表</option>' +
     d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  const dsel = $('devSheet');
+  dsel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}（${s.formula_count} 个公式）</option>`).join('');
   const mvSrc = $('mvSrcSheet'), mvTgt = $('mvTgtSheet');
   const mvOpts = d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   mvSrc.innerHTML = mvOpts;
   mvTgt.innerHTML = mvOpts;
   $('moveBtn').disabled = false;
+  $('devBtn').disabled = false;
 
   const cp = $('cyclePanel');
   if (d.cycle_count > 0) {
@@ -557,6 +604,7 @@ async function loadImpact(cell) {
 function showImpactView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'none';
   $('empty').style.display = CURRENT ? 'none' : 'block';
   $('detailBody').style.display = CURRENT ? 'block' : 'none';
@@ -565,6 +613,16 @@ function showImpactView() {
 function showAuditView() {
   $('auditView').style.display = 'block';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
+  $('moveView').style.display = 'none';
+  $('empty').style.display = 'none';
+  $('detailBody').style.display = 'none';
+}
+
+function showDevView() {
+  $('auditView').style.display = 'none';
+  $('keyView').style.display = 'none';
+  $('devView').style.display = 'block';
   $('moveView').style.display = 'none';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -573,6 +631,7 @@ function showAuditView() {
 function showKeyView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'block';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'none';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -581,6 +640,7 @@ function showKeyView() {
 function showMoveView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'block';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -801,6 +861,80 @@ async function loadKeyNodes() {
   if (!r.ok) { $('knErr').textContent = d.detail || '关键节点分析失败'; return; }
   renderKeySummary(d);
   renderKeyRows(d);
+}
+
+// ---------------- 同列公式偏离检查 ----------------
+$('devBtn').onclick = async () => {
+  showDevView();
+  await loadDeviations();
+};
+$('devRunBtn').onclick = () => loadDeviations();
+$('devSheet').onchange = () => loadDeviations();
+$('devExportBtn').onclick = () => {
+  if (!WID) return;
+  const sh = $('devSheet').value;
+  window.location = `/api/workbooks/${WID}/formula-deviations` +
+    (sh ? `?sheet=${encodeURIComponent(sh)}` : '');
+};
+
+async function loadDeviations() {
+  if (!WID) return;
+  $('devErr').textContent = '';
+  const sh = $('devSheet').value;
+  const p = new URLSearchParams();
+  if (sh) p.set('sheet', sh);
+  const r = await fetch(`/api/workbooks/${WID}/formula-deviations?` + p);
+  const d = await r.json();
+  if (!r.ok) { $('devErr').textContent = d.detail || '检查失败'; return; }
+  renderDeviations(d);
+}
+
+function renderDeviations(d) {
+  // 下拉保留全部工作表，并在已有检查结果的表名后标注异常 / 已检查区段数
+  const statsByName = Object.fromEntries(d.sheets.map(s => [s.name, s]));
+  const cur = $('devSheet').value;
+  $('devSheet').innerHTML = '<option value="">全部工作表</option>' +
+    SHEETS.map(name => {
+      const st = statsByName[name];
+      const tag = !st ? '（无 ≥' + d.min_segment_cells + ' 格区段）'
+        : st.anomalous_segments
+          ? `（异常区段 ${st.anomalous_segments} / 检查 ${st.checked_segments} 段）`
+          : `（检查 ${st.checked_segments} 段，无异常）`;
+      return `<option value="${esc(name)}">${esc(name)}${tag}</option>`;
+    }).join('');
+  $('devSheet').value = cur;
+
+  $('devSummary').innerHTML =
+    `<span class="dev-stat">参与检查的相邻区段（≥${d.min_segment_cells} 格）<b>${d.checked_segment_count}</b></span>` +
+    `<span class="dev-stat">异常区段（全工作簿）<b>${d.anomalous_segment_count}</b></span>` +
+    `<span class="dev-stat">偏离公式格（全工作簿）<b>${d.total_deviation_cell_count}</b></span>` +
+    `<span class="dev-stat">公式格总数<b>${d.formula_cell_count}</b></span>`;
+
+  $('devTableTitle').textContent =
+    `异常区段清单（${d.total} 个区段，共 ${d.deviation_cell_count} 个偏离公式格）`;
+  $('devRows').innerHTML = d.segments.map(seg => {
+    const detail = `<div class="dev-main">✔ 主流 ${seg.majority_count}/${seg.segment_rows} 格，
+        示例 <a class="link js-cell" data-cell="${esc(seg.majority_example_cell)}">${esc(seg.majority_example_display)}</a>：
+        <span class="formula-code" style="display:inline-block;padding:2px 8px">${esc(seg.majority_example_formula)}</span></div>` +
+      `<div class="dev-pattern">模板：${esc(seg.majority_pattern)}</div>`;
+    const others = seg.pattern_counts.filter(p => p.pattern !== seg.majority_pattern).map(p =>
+      `<div class="dev-pattern dev-odd" style="margin-top:3px">✖ 另有 ${p.count} 格模板：${esc(p.pattern)}（示例 <a class="link js-cell" data-cell="${esc(p.example_cell)}">${esc(p.example_cell)}</a>）</div>`
+    ).join('');
+    return seg.deviations.map((v, idx) =>
+      `<tr>
+        <td class="mono"><a class="link js-cell" data-cell="${esc(v.cell)}">${esc(v.display)}</a>
+          <span class="badge dev">偏离</span></td>
+        ${idx === 0
+          ? `<td class="mono" rowspan="${seg.deviation_count}">${esc(seg.segment_display)}` +
+            `<div class="muted" style="font-size:11px">相邻 ${seg.segment_rows} 格区段</div></td>`
+          : ''}
+        <td>
+          <div class="formula-code" style="background:#3a2a12;color:#fde68a;margin:0 0 6px">${esc(v.formula)}</div>
+          <div class="dev-pattern" style="margin-bottom:6px">该格模板：${esc(v.pattern)}</div>
+          ${idx === 0 ? detail + others : ''}
+        </td>
+      </tr>`).join('');
+  }).join('') || '<tr><td colspan="3" class="muted" style="padding:14px">🎉 当前工作表筛选下没有发现同列公式偏离（平票 / 不足 3 格的区段不报）。</td></tr>';
 }
 
 // ---------------- 公式区域搬移预演 ----------------

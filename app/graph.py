@@ -1029,6 +1029,13 @@ class WorkbookGraph:
             },
         }
 
+    # ------------------------------------------------------ 同列公式偏离检查
+    def formula_deviations(self, sheet: str | None = None) -> dict:
+        """同列相邻公式区段的模板偏离检查（见 formula_pattern 模块）。"""
+        from .formula_pattern import analyze_deviations
+        return analyze_deviations(
+            self.formulas, [s.name for s in self.sheets], sheet=sheet)
+
     # -------------------------------------------------------------- 汇总
     @staticmethod
     def _name_display(usage: NameUsage) -> str:

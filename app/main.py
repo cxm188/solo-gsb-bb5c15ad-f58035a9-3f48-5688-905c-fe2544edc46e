@@ -231,6 +231,21 @@ def workbook_audit(
     }
 
 
+@app.get("/api/workbooks/{wid}/formula-deviations")
+def workbook_formula_deviations(
+    wid: str,
+    sheet: str | None = Query(default=None, description="按工作表筛选"),
+):
+    """同列公式偏离：仅检查至少 3 格的相邻区段，严格多数模板外的公式报异常。"""
+    graph = _get(wid)["graph"]
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    return {
+        "workbook_id": wid,
+        **graph.formula_deviations(sheet=sheet),
+    }
+
+
 @app.get("/api/workbooks/{wid}/audit/export")
 def workbook_audit_export(wid: str):
     entry = _get(wid)

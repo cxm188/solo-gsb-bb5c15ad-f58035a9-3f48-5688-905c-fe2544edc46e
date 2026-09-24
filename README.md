@@ -46,6 +46,15 @@
     **证据边**，并附带按级别 / 类型的汇总计数；页面提供审计面板与「导出审计 JSON」
 - 💾 一键导出完整分析 JSON（工作表统计、**名称清单与名称使用留痕**、公式清单、
   依赖边、循环环、依赖健康审计）
+- 🧮 **同列公式偏离检查**：按工作表、列把行号相邻的公式格划为区段（非公式行断开），
+  将每条公式按其所在格归一为 **R1C1 相对模板**——相对引用记为相对位移、
+  `$` 绝对行列保持绝对号、混合引用逐维度处理，**跨表限定、整行 / 整列、定义名称、
+  字符串与其他非引用文本原样保留**（如 C2 的 `=A2+$B$1` 与 C3 的 `=A3+$B$1`
+  属于同一模板）
+  - 只检查**至少 3 格**的区段；区段内某模板数量**严格超过一半**时，其余公式标记为
+    偏离；**平票（如 2:2）或无多数不报**
+  - 结果列出每个异常格的**坐标与原公式**、**主流公式示例及其 R1C1 模板**、
+    **区段范围**与各模板计数；支持按工作表筛选并提供 JSON 接口
 - 📋 **公式区域搬移预演**：选源工作表矩形范围、目标工作表与左上角坐标，按
   **Excel 复制 / 粘贴语义**把范围内公式映射到目标区域，逐格列出原公式、拟写入
   公式与目标已有内容冲突，可下载 TSV 粘贴；不修改已上传工作簿
@@ -121,6 +130,7 @@ python -m pytest tests/ -v
 | `GET` | `/api/workbooks/{id}/key-nodes/export` | 导出关键节点分析 JSON（行数与受影响下游不截断） |
 | `GET` | `/api/workbooks/{id}/audit?level=&sheet=&fanout_threshold=` | 依赖健康审计；支持按级别（`error`/`warning`/`info`，可重复）、工作表、扇出阈值筛选 |
 | `GET` | `/api/workbooks/{id}/audit/export` | 导出依赖健康审计 JSON（证据边不截断） |
+| `GET` | `/api/workbooks/{id}/formula-deviations?sheet=` | 同列公式偏离检查：至少 3 格的相邻区段中，严格多数模板之外的公式；支持按工作表筛选 |
 | `POST` | `/api/workbooks/{id}/relocate/preview` | 公式区域搬移预演（JSON 体：`source_sheet` / `source_range` / `target_sheet` / `target_anchor`） |
 | `POST` | `/api/workbooks/{id}/relocate/tsv` | 下载预演 TSV（目标位置 + 拟写入公式；不可平移时返回 400） |
 | `GET` | `/api/workbooks/{id}/export` | 导出完整分析 JSON（含 `audit` 段） |
@@ -141,6 +151,10 @@ curl "http://localhost:8000/api/workbooks/$WID/audit?level=error&level=warning&s
 
 # 下载审计 JSON（证据边完整，不做 100 条截断）
 curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
+
+# 同列公式偏离检查（可按工作表筛选；浏览器直接打开即为 JSON 下载）
+curl "http://localhost:8000/api/workbooks/$WID/formula-deviations"
+curl "http://localhost:8000/api/workbooks/$WID/formula-deviations?sheet=同列偏离"
 
 # 公式区域搬移预演：源 搬移演示!B2:B6 -> 同表 D2
 curl -s -X POST "http://localhost:8000/api/workbooks/$WID/relocate/preview" \
@@ -332,6 +346,79 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 > 接口返回的单条问题最多附带 100 条证据边（超出时带 `evidence_truncated` /
 > `evidence_total`）；`/audit/export` 与完整导出不截断。
 
+### 同列公式偏离 JSON 结构
+
+`GET /api/workbooks/{id}/formula-deviations?sheet=同列偏离`：
+
+```json
+{
+  "workbook_id": "ab12cd34ef56",
+  "segments": [
+    {
+      "sheet": "同列偏离",
+      "column": "C",
+      "column_index": 3,
+      "segment": "C2:C11",
+      "segment_display": "同列偏离!C2:C11",
+      "segment_start": "C2",
+      "segment_end": "C11",
+      "start_row": 2,
+      "segment_rows": 10,
+      "majority_pattern": "=R[0]C[-2]*R1C2",
+      "majority_count": 9,
+      "majority_example_cell": "同列偏离!C2",
+      "majority_example_display": "同列偏离!C2",
+      "majority_example_formula": "=A2*$B$1",
+      "deviation_count": 1,
+      "deviations": [
+        {
+          "cell": "同列偏离!C6",
+          "sheet": "同列偏离",
+          "row": 6,
+          "coord": "C6",
+          "display": "同列偏离!C6",
+          "formula": "=A6*B6",
+          "pattern": "=R[0]C[-2]*R[0]C[-1]"
+        }
+      ],
+      "pattern_counts": [
+        { "pattern": "=R[0]C[-2]*R1C2", "count": 9,
+          "example_cell": "同列偏离!C2", "example_formula": "=A2*$B$1" },
+        { "pattern": "=R[0]C[-2]*R[0]C[-1]", "count": 1,
+          "example_cell": "同列偏离!C6", "example_formula": "=A6*B6" }
+      ]
+    }
+  ],
+  "total": 3,
+  "deviation_cell_count": 3,
+  "checked_segment_count": 11,
+  "anomalous_segment_count": 3,
+  "total_deviation_cell_count": 3,
+  "formula_cell_count": 44,
+  "min_segment_cells": 3,
+  "sheets": [
+    { "name": "计算", "checked_segments": 1, "anomalous_segments": 0, "deviation_cells": 0 }
+  ],
+  "filters": { "sheet": null }
+}
+```
+
+字段说明：
+
+- 模板（`pattern` / `majority_pattern`）为按公式所在格归一的 **R1C1 表示**：
+  相对引用写成位移（`R[0]C[-2]` 表示同一行左侧两列；`R1C2` 表示绝对的 `$B$1`），
+  混合引用逐维度处理；跨表限定、整行 / 整列、定义名称、字符串与函数名等原样保留。
+- 区段（`segment`）是同一工作表同一列内**行号连续**的公式格范围（非公式行即断开）；
+  少于 3 格的区段不参与检查，不计入 `checked_segment_count`。
+- 仅当某模板数量**严格超过区段格数一半**时才产生一条区段结果，其余模板的全部公式
+  列入 `deviations`（含坐标、原公式与各自模板）；最高得票不过半（含 2:2 平票、
+  2:1:1 等）时整段不报。
+- `majority_example_formula` 是主流模板的一格**真实公式原文**（便于人工对照）；
+  `pattern_counts` 给出区段内全部模板的计数与示例。
+- `checked_segment_count` / `anomalous_segment_count` / `total_deviation_cell_count`
+  始终是全工作簿口径；`segments` / `total` / `deviation_cell_count` 受 `sheet`
+  筛选影响，`sheets` 列出各表计数供页面筛选器展示。工作表不存在返回 404。
+
 ### 导出 JSON 结构
 
 完整导出 `/api/workbooks/{id}/export`：
@@ -390,6 +477,9 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 | `搬移演示` | 公式搬移预演示例：相对 / 绝对 / 混合引用、区域、跨表引用、定义名称，
   以及一个目标区已有内容（演示覆盖冲突）；把「名称」表 `B9:B15` 作为源则可看到
   无法平移时整次预演不可导出 |
+| `同列偏离` | 同列公式偏离检查示例：`C2:C11` 主流相对模板中 C6 误写相对 `B6`、`I2:I6`
+  跨表相对模板中 I5 误写绝对 `$B$2`、`K2:K5` 中 K5 偏离（K7:K8 不足 3 格不报）；
+  `E2:E5` 为 2:2 平票、`G2:G4` 模板一致，均不报 |
 
 推荐体验路径：
 
@@ -410,6 +500,10 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
    平移、目标 `D2` 已有内容被标为覆盖冲突，并可「下载目标坐标与公式 TSV」；
    把目标工作表换成 `月报 2026` 可观察同表引用自动补表名、跨表引用 `计算!B6`
    保持限定；把源换成 `名称` 表 `B9:B15` 则整次预演因未定义 / 失效名称变为不可导出。
+10. 点击「🧮 同列公式偏离」，筛选到 `同列偏离` 表：可看到 `C2:C11`（9 格主流、
+    C6 偏离）、`I2:I6`（I5 把跨表相对引用误写成 `参数!$B$2`）、`K2:K5`
+    （K5 偏离）三段；`E2:E5` 的 2:2 平票、`G2:G4` 的一致区段与 `K7:K8`
+    的不足 3 格区段均不出现在结果中；「导出检查结果 JSON」可获得机器可读结果。
 
 ## 实现要点
 
@@ -448,6 +542,15 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
     （不回读活动单元格），全程纯函数、绝不写工作簿；
   - 平移后越过 XFD / 1048576、`#REF!`、缺失工作表等逐格记入 `errors` 且
     `exportable=false`，TSV 接口此时返回 400；落入已用范围之外只记 `notices`。
+- `app/formula_pattern.py`：同列公式偏离检查。
+  - 复用 `scan_formula()` 的带区间 token，把引用按公式所在格归一为 **R1C1**：
+    相对端写相对位移（`R[0]C[-2]`）、`$` 绝对端写绝对行列号（`R1C2`），区域 /
+    整行 / 整列逐端归一，跨表限定保留（含带引号表名）；定义名称、`#REF!`、
+    字符串、函数名、结构化引用与运算符等落在 token 间隙中**原样保留**；
+  - 按（工作表, 列）收集公式格并按行号相邻切区段，不足 3 格不检查；区段内用
+    `Counter` 统计模板，**得票数严格过半**才把其余模板的公式标记为偏离，
+    平票 / 多模板无多数整段跳过；结果含异常坐标与原公式、主流模板的一格真实
+    公式示例、区段范围与全部模板计数，全局计数与按表筛选的可见列表分离。
 - `app/main.py`：FastAPI 路由与内存 LRU 式工作簿缓存（不落盘，重启即清空）；
   上传时同时保留公式形态工作簿对象供搬移预演读取快照。
 
@@ -458,13 +561,14 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 ├── app/
 │   ├── main.py              # FastAPI 入口与 API
 │   ├── formula_parser.py    # 公式引用 / 定义名称词法解析（带字符区间与 $ 标记）
+│   ├── formula_pattern.py   # 同列公式模板归一（R1C1）与相邻区段偏离检查
 │   ├── names.py             # 名称管理器：作用域解析、展开、名称环检测
 │   ├── graph.py             # 依赖图 / 环检测 / 影响面 BFS / 审计
 │   ├── relocate.py          # 公式区域搬移预演（快照平移 / 冲突 / TSV）
 │   └── static/index.html    # 前端单页
 ├── samples/sample_impact.xlsx
 ├── scripts/make_sample.py   # 示例文件生成脚本
-├── tests/                   # pytest 用例（111 个）
+├── tests/                   # pytest 用例
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
