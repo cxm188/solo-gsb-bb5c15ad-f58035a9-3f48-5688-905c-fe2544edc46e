@@ -103,6 +103,19 @@
   #auditCountPill { background: var(--warn); color: #fff; border-radius: 10px;
                     font-size: 11px; padding: 0 7px; margin-left: 4px; display: none; }
   #auditCountPill.zero { background: var(--accent2); }
+  /* 公式偏离检查面板 */
+  #devCountPill { background: var(--warn); color: #fff; border-radius: 10px;
+                  font-size: 11px; padding: 0 7px; margin-left: 4px; display: none; }
+  #devCountPill.zero { background: var(--accent2); }
+  #devView select { width: auto; min-width: 140px; }
+  #devView .filters-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .dev-seg { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .dev-seg .dev-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .dev-seg .dev-range { font-family: ui-monospace, Consolas, monospace; font-weight: 600; }
+  .dev-major { background: #172a22; border-radius: 6px; padding: 6px 10px; margin: 6px 0;
+               font-size: 12px; }
+  .dev-anom { background: #3a1d22; border-radius: 6px; padding: 6px 10px; margin: 6px 0;
+              font-size: 12px; }
   /* 关键节点面板 */
   #keyView select, #keyView input[type=number] { width: auto; min-width: 120px; }
   #keyView input[type=number] { width: 90px; }
@@ -154,6 +167,7 @@
   <h1>📊 电子表格公式影响分析</h1>
   <span id="fname" class="muted"></span>
   <button class="btn ghost" id="auditBtn" disabled>🩺 依赖健康审计<span id="auditCountPill"></span></button>
+  <button class="btn ghost" id="devBtn" disabled>🧭 公式偏离检查<span id="devCountPill"></span></button>
   <button class="btn ghost" id="moveBtn" disabled>📋 公式搬移预演</button>
   <button class="btn ghost" id="auditExportBtn" disabled>导出审计 JSON</button>
   <button class="btn ghost" id="exportBtn" disabled>导出分析 JSON</button>
@@ -254,6 +268,27 @@
           </tr></thead>
           <tbody id="knRows"></tbody>
         </table>
+      </div>
+    </div>
+    <div id="devView" style="display:none">
+      <div class="card">
+        <h3>🧭 同列公式偏离检查</h3>
+        <div class="muted" style="font-size:12px;line-height:1.7">
+          同一列中上下相邻的公式格通常是同一公式向下填充的结果。本检查把每个公式按所在格归一为模板
+          （引用改写为相对位移，<b>$ 绝对行列、跨表限定、字符串与其余文本原样保留</b>），
+          对至少 3 格的相邻区段统计模板：某模板数量<b>严格超过一半</b>时，区段内其余公式被标记为偏离；
+          平票或无多数模板不报。
+        </div>
+        <div class="filters-row" style="margin-top:10px">
+          <select id="devSheet"><option value="">全部工作表</option></select>
+          <button class="btn" id="devRunBtn" style="padding:6px 14px">重新检查</button>
+          <span id="devErr" class="muted" style="font-size:12px;color:var(--warn)"></span>
+        </div>
+        <div class="audit-counts" id="devCounts"></div>
+      </div>
+      <div class="card">
+        <h3 id="devTableTitle">偏离区段</h3>
+        <div id="devSegments"></div>
       </div>
     </div>
     <div id="moveView" style="display:none">
@@ -432,9 +467,11 @@ function onUploaded(d) {
   $('exportBtn').disabled = false;
   $('auditBtn').disabled = false;
   $('auditExportBtn').disabled = false;
+  $('devBtn').disabled = false;
   $('stAudit').textContent = '扫描中…';
   AUDIT_SUMMARY = null;
   $('auditCountPill').style.display = 'none';
+  $('devCountPill').style.display = 'none';
 
   const sel = $('sheetSelect');
   sel.innerHTML = '<option value="">全部工作表</option>' +
@@ -444,6 +481,9 @@ function onUploaded(d) {
     d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   const ksel = $('knSheet');
   ksel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  const dsel = $('devSheet');
+  dsel.innerHTML = '<option value="">全部工作表</option>' +
     d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   const mvSrc = $('mvSrcSheet'), mvTgt = $('mvTgtSheet');
   const mvOpts = d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
@@ -461,6 +501,7 @@ function onUploaded(d) {
   } else { cp.style.display = 'none'; cp.innerHTML = ''; }
   loadCells();
   loadAuditSummary();
+  loadDeviationSummary();
 }
 
 // ---------------- 单元格列表 ----------------
@@ -557,6 +598,7 @@ async function loadImpact(cell) {
 function showImpactView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'none';
   $('empty').style.display = CURRENT ? 'none' : 'block';
   $('detailBody').style.display = CURRENT ? 'block' : 'none';
@@ -565,6 +607,7 @@ function showImpactView() {
 function showAuditView() {
   $('auditView').style.display = 'block';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'none';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -573,6 +616,16 @@ function showAuditView() {
 function showKeyView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'block';
+  $('devView').style.display = 'none';
+  $('moveView').style.display = 'none';
+  $('empty').style.display = 'none';
+  $('detailBody').style.display = 'none';
+}
+
+function showDevView() {
+  $('auditView').style.display = 'none';
+  $('keyView').style.display = 'none';
+  $('devView').style.display = 'block';
   $('moveView').style.display = 'none';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -581,6 +634,7 @@ function showKeyView() {
 function showMoveView() {
   $('auditView').style.display = 'none';
   $('keyView').style.display = 'none';
+  $('devView').style.display = 'none';
   $('moveView').style.display = 'block';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
@@ -685,6 +739,77 @@ async function loadAudit() {
       </td>
     </tr>`).join('')
     || '<tr><td colspan="4" class="muted" style="padding:14px">🎉 当前筛选条件下未发现问题</td></tr>';
+}
+
+// ---------------- 同列公式偏离检查 ----------------
+$('devBtn').onclick = async () => {
+  showDevView();
+  await loadDeviation();
+};
+$('devRunBtn').onclick = () => loadDeviation();
+$('devSheet').onchange = () => loadDeviation();
+
+function devParams() {
+  const p = new URLSearchParams();
+  const sh = $('devSheet').value;
+  if (sh) p.set('sheet', sh);
+  return p;
+}
+
+function renderDevSummary(d) {
+  const pill = $('devCountPill');
+  pill.textContent = d.anomaly_count;
+  pill.className = d.anomaly_count === 0 ? 'zero' : '';
+  pill.style.display = 'inline-block';
+  $('devCounts').innerHTML =
+    `<span class="ac ${d.anomaly_count ? 'error' : 'info'}">偏离公式<b>${d.anomaly_count}</b></span>` +
+    `<span class="ac">偏离区段<b>${d.segments_with_anomalies}</b></span>` +
+    `<span class="ac">已检查区段（相邻 ≥ ${d.min_segment_size} 格）<b>${d.segments_checked}</b></span>`;
+}
+
+async function loadDeviationSummary() {
+  if (!WID) return;
+  const r = await fetch(`/api/workbooks/${WID}/deviation`);
+  if (r.ok) renderDevSummary(await r.json());
+  else $('devCountPill').style.display = 'none';
+}
+
+async function loadDeviation() {
+  if (!WID) return;
+  $('devErr').textContent = '';
+  const r = await fetch(`/api/workbooks/${WID}/deviation?` + devParams());
+  const d = await r.json();
+  if (!r.ok) { $('devErr').textContent = d.detail || '偏离检查失败'; return; }
+  renderDevSummary(d);
+  $('devTableTitle').textContent =
+    `偏离区段（共 ${d.segments_with_anomalies} 个，含 ${d.anomaly_count} 个偏离公式）`;
+  if (!d.segments.length) {
+    $('devSegments').innerHTML = '<div class="muted" style="padding:14px">' +
+      (d.segments_checked
+        ? '🎉 当前筛选条件下未发现偏离：所有已检查区段的公式模板一致或无多数模板。'
+        : '当前筛选条件下没有可检查的区段（同列相邻公式格不足 3 个）。') + '</div>';
+    return;
+  }
+  $('devSegments').innerHTML = d.segments.map(seg => {
+    const anoms = seg.anomalies.map(a => `
+      <div class="dev-anom">⚠ <a class="link js-cell" data-cell="${esc(a.cell)}"><b class="mono">${esc(a.display)}</b></a>
+        <div class="formula-code" style="margin-top:4px">${esc(a.formula)}</div>
+        <div class="muted" style="margin-top:3px">归一模板：<span class="mono">${esc(a.template)}</span></div>
+      </div>`).join('');
+    return `<div class="dev-seg">
+      <div class="dev-head">
+        <span class="dev-range">${esc(seg.display)}</span>
+        <span class="badge n">${seg.cell_count} 格 / ${seg.template_count} 种模板</span>
+        <span class="badge sev-error">偏离 ${seg.anomalies.length}</span>
+      </div>
+      <div class="dev-major">✔ 主流模板（${seg.majority.count}/${seg.cell_count} 格），示例
+        <a class="link js-cell" data-cell="${esc(seg.majority.example_cell)}"><b class="mono">${esc(seg.majority.example_display)}</b></a>：
+        <div class="formula-code" style="margin-top:4px">${esc(seg.majority.example_formula)}</div>
+        <div class="muted" style="margin-top:3px">归一模板：<span class="mono">${esc(seg.majority.template)}</span></div>
+      </div>
+      ${anoms}
+    </div>`;
+  }).join('');
 }
 
 // ---------------- 关键节点分析 ----------------

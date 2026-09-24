@@ -44,6 +44,11 @@
   - `info` —— **未被任何公式引用的孤立公式**
   - 每条问题给出级别、单元格位置、问题说明、涉及名称的作用域 / 定义 / 解析链与
     **证据边**，并附带按级别 / 类型的汇总计数；页面提供审计面板与「导出审计 JSON」
+- 🧭 **同列公式偏离检查**：按工作表、列把相邻公式格划为区段，公式按所在格归一为
+  模板（引用转为相对位移，`$` 绝对行列、跨表限定、字符串与其余文本原样保留，
+  如 `C2` 的 `=A2+$B$1` 与 `C3` 的 `=A3+$B$1` 属同一模板）；区段 ≥ 3 格且某模板
+  **严格过半**时标记其余偏离公式，平票 / 无多数不报；结果列出异常坐标与原公式、
+  主流公式示例与区段范围，页面列表与 JSON 接口均支持按工作表筛选
 - 💾 一键导出完整分析 JSON（工作表统计、**名称清单与名称使用留痕**、公式清单、
   依赖边、循环环、依赖健康审计）
 - 📋 **公式区域搬移预演**：选源工作表矩形范围、目标工作表与左上角坐标，按
@@ -121,6 +126,7 @@ python -m pytest tests/ -v
 | `GET` | `/api/workbooks/{id}/key-nodes/export` | 导出关键节点分析 JSON（行数与受影响下游不截断） |
 | `GET` | `/api/workbooks/{id}/audit?level=&sheet=&fanout_threshold=` | 依赖健康审计；支持按级别（`error`/`warning`/`info`，可重复）、工作表、扇出阈值筛选 |
 | `GET` | `/api/workbooks/{id}/audit/export` | 导出依赖健康审计 JSON（证据边不截断） |
+| `GET` | `/api/workbooks/{id}/deviation?sheet=` | 同列公式偏离检查；支持按工作表筛选 |
 | `POST` | `/api/workbooks/{id}/relocate/preview` | 公式区域搬移预演（JSON 体：`source_sheet` / `source_range` / `target_sheet` / `target_anchor`） |
 | `POST` | `/api/workbooks/{id}/relocate/tsv` | 下载预演 TSV（目标位置 + 拟写入公式；不可平移时返回 400） |
 | `GET` | `/api/workbooks/{id}/export` | 导出完整分析 JSON（含 `audit` 段） |
@@ -141,6 +147,9 @@ curl "http://localhost:8000/api/workbooks/$WID/audit?level=error&level=warning&s
 
 # 下载审计 JSON（证据边完整，不做 100 条截断）
 curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
+
+# 同列公式偏离检查（可加 ?sheet=偏离示例 限定工作表）
+curl "http://localhost:8000/api/workbooks/$WID/deviation"
 
 # 公式区域搬移预演：源 搬移演示!B2:B6 -> 同表 D2
 curl -s -X POST "http://localhost:8000/api/workbooks/$WID/relocate/preview" \
@@ -295,11 +304,11 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
       "evidence": [ { "from": "审计示例!B4", "to": "数据!B2" } ]
     }
   ],
-  "total": 41,
-  "counts_by_level": { "error": 6, "warning": 7, "info": 28 },
+  "total": 58,
+  "counts_by_level": { "error": 6, "warning": 7, "info": 45 },
   "counts_by_code": { "missing_sheet": 2, "undefined_name": 2, "invalid_name": 2,
                       "external_name": 1, "empty_ref": 2, "out_of_range": 2,
-                      "high_fanout": 2, "orphan_formula": 28 },
+                      "high_fanout": 2, "orphan_formula": 45 },
   "fanout_threshold": 20,
   "filters": { "levels": ["error", "warning", "info"], "sheet": null }
 }
@@ -332,6 +341,55 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 > 接口返回的单条问题最多附带 100 条证据边（超出时带 `evidence_truncated` /
 > `evidence_total`）；`/audit/export` 与完整导出不截断。
 
+### 公式偏离检查 JSON 结构
+
+`GET /api/workbooks/{id}/deviation`（可用 `?sheet=` 限定工作表）：
+
+```json
+{
+  "workbook_id": "ab12cd34ef56",
+  "segments_checked": 8,
+  "segments_with_anomalies": 1,
+  "anomaly_count": 1,
+  "min_segment_size": 3,
+  "filters": { "sheet": null },
+  "segments": [
+    {
+      "sheet": "偏离示例",
+      "column": "C",
+      "range": "C2:C8",
+      "display": "偏离示例!C2:C8",
+      "cell_count": 7,
+      "template_count": 2,
+      "majority": {
+        "template": "=R[0]C[-2]+R1C2",
+        "count": 6,
+        "example_cell": "偏离示例!C2",
+        "example_display": "偏离示例!C2",
+        "example_formula": "=A2+$B$1"
+      },
+      "anomalies": [
+        { "cell": "偏离示例!C5", "coord": "C5", "display": "偏离示例!C5",
+          "formula": "=A4+$B$1", "template": "=R[-1]C[-2]+R1C2" }
+      ]
+    }
+  ]
+}
+```
+
+字段说明：
+
+- 模板串为 R1C1 风格归一结果：相对维写作位移（`R[0]C[-2]` 表示同行、左数
+  第 2 列），`$` 绝对维保留原值（`R1C2` 即 `$B$1`）；跨表限定、字符串、
+  定义名称与其余文本原样保留，因此 `C2` 的 `=A2+$B$1` 与 `C3` 的 `=A3+$B$1`
+  归一结果相同、属同一模板。
+- 仅当区段（同工作表、同列、行号相邻）公式格数 ≥ 3 且某模板数量
+  **严格超过一半**时，其余模板的公式格进入 `anomalies`；平票或无多数模板的
+  区段不报。`segments` 只列出存在偏离的区段，`segments_checked` 为参与检查
+  的区段总数。
+- `majority` 给出主流模板、命中格数与一个主流公式示例；`range` / `display`
+  为区段范围。`sheet` 参数指定不存在的工作表返回 404。
+
 ### 导出 JSON 结构
 
 完整导出 `/api/workbooks/{id}/export`：
@@ -339,9 +397,9 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 ```json
 {
   "filename": "sample_impact.xlsx",
-  "summary": { "sheets": [...], "formula_count": 41, "edge_count": 459,
+  "summary": { "sheets": [...], "formula_count": 59, "edge_count": 487,
                "defined_name_count": 16, "workbook_scoped_count": 14,
-               "sheet_scoped_count": 2, "name_usage_count": 17,
+               "sheet_scoped_count": 2, "name_usage_count": 19,
                "cycle_count": 2, "cycles": [["循环!A1","循环!B1"],["循环!C1"]] },
   "defined_names": [
     { "name": "单价", "scope": "workbook", "scope_sheet": null,
@@ -374,7 +432,7 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 ## 示例文件
 
 `samples/sample_impact.xlsx`（由 `scripts/make_sample.py` 生成，也可在首页直接下载）
-包含 8 个工作表，覆盖所有分析场景：
+包含 9 个工作表，覆盖所有分析场景：
 
 | 工作表 | 内容 |
 |---|---|
@@ -390,6 +448,9 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 | `搬移演示` | 公式搬移预演示例：相对 / 绝对 / 混合引用、区域、跨表引用、定义名称，
   以及一个目标区已有内容（演示覆盖冲突）；把「名称」表 `B9:B15` 作为源则可看到
   无法平移时整次预演不可导出 |
+| `偏离示例` | 同列公式偏离检查示例：`C2:C8` 为 `=A{行}+$B$1` 向下填充（`C5` 误引
+  上一行，被多数模板标记）；`E` 列两种模板各半（平票不报）、`G` 列仅 2 格
+  （不足 3 格区段，不检查） |
 
 推荐体验路径：
 
@@ -410,6 +471,10 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
    平移、目标 `D2` 已有内容被标为覆盖冲突，并可「下载目标坐标与公式 TSV」；
    把目标工作表换成 `月报 2026` 可观察同表引用自动补表名、跨表引用 `计算!B6`
    保持限定；把源换成 `名称` 表 `B9:B15` 则整次预演因未定义 / 失效名称变为不可导出。
+10. 点击「🧭 公式偏离检查」，可看到「偏离示例」表 `C2:C8` 区段中 `C5` 偏离主流模板
+    （主流 6/7 格为 `=A{行}+$B$1`，`C5` 误写为 `=A4+$B$1`）；`E` 列平票、`G` 列
+    不足 3 格均不报。用工作表下拉可筛选检查范围，或访问
+    `/api/workbooks/{id}/deviation` 获取同样结构的 JSON。
 
 ## 实现要点
 
@@ -448,6 +513,12 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
     （不回读活动单元格），全程纯函数、绝不写工作簿；
   - 平移后越过 XFD / 1048576、`#REF!`、缺失工作表等逐格记入 `errors` 且
     `exportable=false`，TSV 接口此时返回 400；落入已用范围之外只记 `notices`。
+- `app/deviation.py`：同列公式偏离检查。
+  - 复用 `scan_formula()` 的**带字符区间 token**，把引用按公式所在格归一为
+    R1C1 风格模板串（相对维为 `[位移]`、`$` 绝对维保留原值），跨表限定、
+    字符串字面量、定义名称与其余非引用文本逐字保留；
+  - 按（工作表、列）收集公式格，行号相邻划为区段，仅检查 ≥ 3 格的区段；
+    某模板计数**严格过半**时标记区段内其余公式为偏离，平票 / 无多数不报。
 - `app/main.py`：FastAPI 路由与内存 LRU 式工作簿缓存（不落盘，重启即清空）；
   上传时同时保留公式形态工作簿对象供搬移预演读取快照。
 
@@ -461,10 +532,11 @@ curl -OJ -X POST "http://localhost:8000/api/workbooks/$WID/relocate/tsv" \
 │   ├── names.py             # 名称管理器：作用域解析、展开、名称环检测
 │   ├── graph.py             # 依赖图 / 环检测 / 影响面 BFS / 审计
 │   ├── relocate.py          # 公式区域搬移预演（快照平移 / 冲突 / TSV）
+│   ├── deviation.py         # 同列公式偏离检查（模板归一 / 区段 / 多数规则）
 │   └── static/index.html    # 前端单页
 ├── samples/sample_impact.xlsx
 ├── scripts/make_sample.py   # 示例文件生成脚本
-├── tests/                   # pytest 用例（111 个）
+├── tests/                   # pytest 用例（127 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from openpyxl import load_workbook
 from pydantic import BaseModel
 
+from .deviation import detect_formula_deviations
 from .graph import (
     AUDIT_LEVELS,
     DEFAULT_FANOUT_THRESHOLD,
@@ -33,7 +34,7 @@ MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰�
 STATIC_DIR = Path(__file__).parent / "static"
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
-app = FastAPI(title="电子表格公式影响分析", version="1.1.0")
+app = FastAPI(title="电子表格公式影响分析", version="1.2.0")
 
 # wid -> {"graph": WorkbookGraph, "filename": str, "ts": float}
 _store: OrderedDict[str, dict] = OrderedDict()
@@ -251,6 +252,21 @@ def workbook_audit_export(wid: str):
             )
         },
     )
+
+
+@app.get("/api/workbooks/{wid}/deviation")
+def workbook_deviation(
+    wid: str,
+    sheet: str | None = Query(default=None, description="按工作表筛选"),
+):
+    """同列公式偏离检查：同列相邻公式格归一为模板后，标记区段中偏离多数模板的公式。"""
+    graph = _get(wid)["graph"]
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    return {
+        "workbook_id": wid,
+        **detect_formula_deviations(graph, sheet=sheet),
+    }
 
 
 @app.get("/api/workbooks/{wid}/export")
